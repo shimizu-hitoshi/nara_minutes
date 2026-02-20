@@ -24,6 +24,7 @@ from playwright.async_api import Page, async_playwright
 BASE_URL = "https://ssp.kaigiroku.net/tenant/narashi"
 TOP_URL = f"{BASE_URL}/SpTop.html"
 SEARCH_URL = f"{BASE_URL}/SpSearch.html"
+SEARCH_RESULT_URL = f"{BASE_URL}/SpSearchResult.html"
 
 
 @dataclass
@@ -122,6 +123,17 @@ async def _extract_meetings_from_page(page: Page) -> list[Meeting]:
         "[onclick*='MinuteView']",
         ".meeting-item",
         ".list-item",
+        # kaigiroku.net の新しい構造に対応するセレクタ
+        'li[data-council-id]',
+        'li[data-schedule-id]',
+        'tr[data-council-id]',
+        '[data-council-id][data-schedule-id]',
+        'a[href*="council_id"]',
+        'a[href*="schedule_id"]',
+        '.sp-list-item',
+        '.council-item',
+        '.schedule-item',
+        'li > a[href]',
     ]
 
     found_elements = []
@@ -136,14 +148,23 @@ async def _extract_meetings_from_page(page: Page) -> list[Meeting]:
 
     for element in found_elements:
         try:
-            # onclick・href属性からIDを抽出
+            # onclick・href・data属性からIDを抽出
             onclick = await element.get_attribute("onclick") or ""
             href = await element.get_attribute("href") or ""
+            data_council_id = await element.get_attribute("data-council-id") or ""
+            data_schedule_id = await element.get_attribute("data-schedule-id") or ""
 
             council_id, schedule_id = "", ""
             url = ""
 
-            if href and ("council_id" in href or "MinuteView" in href):
+            if data_council_id and data_schedule_id:
+                council_id = data_council_id
+                schedule_id = data_schedule_id
+                url = (
+                    f"{BASE_URL}/SpMinuteView.html"
+                    f"?council_id={council_id}&schedule_id={schedule_id}"
+                )
+            elif href and ("council_id" in href or "MinuteView" in href):
                 council_id, schedule_id = _extract_ids_from_url(href)
                 url = (
                     href
@@ -153,7 +174,10 @@ async def _extract_meetings_from_page(page: Page) -> list[Meeting]:
             elif onclick:
                 council_id, schedule_id = _extract_ids_from_onclick(onclick)
                 if council_id and schedule_id:
-                    url = f"{BASE_URL}/SpMinuteView.html?council_id={council_id}&schedule_id={schedule_id}"
+                    url = (
+                        f"{BASE_URL}/SpMinuteView.html"
+                        f"?council_id={council_id}&schedule_id={schedule_id}"
+                    )
 
             if not council_id and not url:
                 continue
@@ -203,15 +227,120 @@ async def _extract_meetings_from_page(page: Page) -> list[Meeting]:
     return meetings
 
 
+def _parse_meetings_from_json(data: dict | list) -> list[Meeting]:
+    """APIのJSONレスポンスから会議一覧を解析
+
+    kaigiroku.netのAPIは様々なフィールド名を使用するため、
+    複数のパターンを試みます。
+    """
+    meetings: list[Meeting] = []
+    seen_ids: set[tuple[str, str]] = set()
+
+    # レスポンスがリストの場合はそのまま、辞書の場合はリストを探す
+    items: list = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for key in ("councilList", "meetings", "items", "list", "data", "results"):
+            if key in data and isinstance(data[key], list):
+                items = data[key]
+                break
+        if not items:
+            # 再帰的に辞書内のリストを探す
+            for value in data.values():
+                if isinstance(value, list) and value:
+                    items = value
+                    break
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # council_id の候補フィールド
+        council_id = str(
+            item.get("council_id")
+            or item.get("councilId")
+            or item.get("CouncilId")
+            or ""
+        )
+        # schedule_id の候補フィールド
+        schedule_id = str(
+            item.get("schedule_id")
+            or item.get("scheduleId")
+            or item.get("ScheduleId")
+            or ""
+        )
+        if not council_id or not schedule_id:
+            continue
+        key = (council_id, schedule_id)
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+
+        # タイトル候補フィールド
+        title = str(
+            item.get("council_name")
+            or item.get("councilName")
+            or item.get("meetingName")
+            or item.get("title")
+            or item.get("name")
+            or f"会議 council_id={council_id} schedule_id={schedule_id}"
+        )
+        # 日付候補フィールド
+        date = str(
+            item.get("open_date")
+            or item.get("openDate")
+            or item.get("date")
+            or item.get("meeting_date")
+            or ""
+        )
+        url = (
+            f"{BASE_URL}/SpMinuteView.html"
+            f"?council_id={council_id}&schedule_id={schedule_id}"
+        )
+        meetings.append(
+            Meeting(
+                title=title,
+                date=date,
+                council_id=council_id,
+                schedule_id=schedule_id,
+                url=url,
+            )
+        )
+    return meetings
+
+
 async def get_meeting_list(
     page: Page, max_meetings: Optional[int] = None
 ) -> list[Meeting]:
-    """トップページから会議リストを取得
+    """会議リストを取得
 
     kaigiroku.netのSpTop.htmlはJavaScriptで動的に会議一覧を表示します。
-    単純なHTTPリクエストではなく、ブラウザ操作が必要です。
+    APIレスポンスの傍受を優先し、DOM解析にフォールバックします。
     """
     meetings: list[Meeting] = []
+    captured_json: list[dict | list] = []
+
+    # APIレスポンスを傍受して会議データを直接取得する
+    async def handle_response(response) -> None:
+        url = response.url
+        if response.request.resource_type not in ("fetch", "xhr"):
+            return
+        if not any(
+            kw in url
+            for kw in ("Meeting", "meeting", "council", "schedule", "search", "list")
+        ):
+            return
+        try:
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type:
+                return
+            data = await response.json()
+            if data:
+                captured_json.append(data)
+        except Exception:
+            pass
+
+    page.on("response", handle_response)
 
     print(f"トップページを読み込み中: {TOP_URL}")
     try:
@@ -221,22 +350,51 @@ async def get_meeting_list(
         print(f"トップページの読み込みに失敗しました: {e}", file=sys.stderr)
         return meetings
 
-    # 「会議一覧」リンクがあれば移動してより多くの会議を取得
-    for link_text in ["会議一覧", "一覧", "MeetingList"]:
-        try:
-            list_link = await page.query_selector(
-                f'a:has-text("{link_text}"), a[href*="MeetingList"], a[href*="meetinglist"]'
-            )
-            if list_link:
-                await list_link.click()
-                await _wait_for_dynamic_content(page)
-                print(f"会議一覧ページに移動しました")
-                break
-        except Exception:
-            continue
+    # 捕捉したAPIレスポンスから会議を抽出
+    for data in captured_json:
+        meetings.extend(_parse_meetings_from_json(data))
+    _deduplicate_meetings(meetings)
 
-    # 現在のページから会議を抽出
-    meetings.extend(await _extract_meetings_from_page(page))
+    if not meetings:
+        # 検索結果ページを直接読み込んで会議一覧を取得する
+        print(f"検索結果ページを読み込み中: {SEARCH_RESULT_URL}")
+        try:
+            captured_json.clear()
+            await page.goto(
+                SEARCH_RESULT_URL, wait_until="domcontentloaded", timeout=60000
+            )
+            await _wait_for_dynamic_content(page)
+        except Exception as e:
+            print(f"検索結果ページの読み込みに失敗しました: {e}", file=sys.stderr)
+
+        for data in captured_json:
+            meetings.extend(_parse_meetings_from_json(data))
+        _deduplicate_meetings(meetings)
+
+    if not meetings:
+        # 「会議一覧」リンクを探してクリックする
+        for link_text in ["会議一覧", "一覧", "MeetingList"]:
+            try:
+                list_link = await page.query_selector(
+                    f'a:has-text("{link_text}"), a[href*="MeetingList"], '
+                    f'a[href*="meetinglist"]'
+                )
+                if list_link:
+                    captured_json.clear()
+                    await list_link.click()
+                    await _wait_for_dynamic_content(page)
+                    print("会議一覧ページに移動しました")
+                    break
+            except Exception:
+                continue
+
+        for data in captured_json:
+            meetings.extend(_parse_meetings_from_json(data))
+        _deduplicate_meetings(meetings)
+
+    if not meetings:
+        # DOMベースの抽出にフォールバック
+        meetings.extend(await _extract_meetings_from_page(page))
 
     # ページネーション: 「次へ」ボタンがある場合はすべてのページを処理
     page_num = 1
@@ -258,14 +416,22 @@ async def get_meeting_list(
             break
 
         try:
+            captured_json.clear()
             await next_btn.click()
             await _wait_for_dynamic_content(page)
             page_num += 1
             print(f"  ページ {page_num} を読み込み中...")
-            new_meetings = await _extract_meetings_from_page(page)
+
+            # APIレスポンスから新しい会議を取得
+            new_meetings: list[Meeting] = []
+            for data in captured_json:
+                new_meetings.extend(_parse_meetings_from_json(data))
+            if not new_meetings:
+                new_meetings = await _extract_meetings_from_page(page)
             if not new_meetings:
                 break
             meetings.extend(new_meetings)
+            _deduplicate_meetings(meetings)
         except Exception as e:
             print(f"  次のページへの移動に失敗しました: {e}", file=sys.stderr)
             break
@@ -275,6 +441,18 @@ async def get_meeting_list(
 
     print(f"{len(meetings)} 件の会議が見つかりました")
     return meetings
+
+
+def _deduplicate_meetings(meetings: list[Meeting]) -> None:
+    """会議リストから重複を除去（インプレース）"""
+    seen: set[tuple[str, str]] = set()
+    unique: list[Meeting] = []
+    for m in meetings:
+        key = (m.council_id, m.schedule_id)
+        if key not in seen:
+            seen.add(key)
+            unique.append(m)
+    meetings[:] = unique
 
 
 async def fetch_minutes(page: Page, meeting: Meeting) -> Optional[Minutes]:
